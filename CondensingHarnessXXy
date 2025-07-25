@@ -1,0 +1,105 @@
+import subprocess
+import hashlib
+import os
+from datetime import datetime
+from multiprocessing import Pool, cpu_count
+from pathlib import Path
+
+INPUT_FOLDER = "CondensingSessions"
+MATH_CACHE = "MathSessions/{latest}/global_cache.txt"
+BUILD_FOLDER = "BuildSessions"
+MAX_PROCESSES = 12
+MODEL_PATH = "/usr/local/bin/ollama"
+MODEL_NAME = "mixtral:8x7b-instruct-v0.1-q6_K"
+
+PROMPT = (
+    "You are a recursive intelligence responsible for constructing code from condensed logic snippets."
+    " Use all recursive mathematical understanding provided to compile a valid, logical, executable toolset component."
+)
+
+
+def get_latest_session_path(session_dir):
+    sessions = sorted(Path(session_dir).glob("*/"), key=os.path.getmtime)
+    return sessions[-1] if sessions else None
+
+
+def read_chunks_from_folder(folder):
+    chunks = []
+    for root, _, files in os.walk(folder):
+        for file in files:
+            if file.endswith(".txt"):
+                path = os.path.join(root, file)
+                with open(path, "r", encoding="utf-8") as f:
+                    chunks.append((file, f.read()))
+    return chunks
+
+
+def hash_content(content):
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+
+def run_model(prompt_input):
+    command = [MODEL_PATH, "run", MODEL_NAME]
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate(input=prompt_input.encode('utf-8'), timeout=180)
+        return stdout.decode('utf-8', 'replace'), stderr.decode('utf-8', 'ignore')
+    except subprocess.TimeoutExpired:
+        return "[ERROR] Timeout expired.", "[TIMEOUT]"
+
+
+def build_component(args):
+    idx, (filename, content), math_reference, out_dir = args
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    prompt_input = f"{math_reference}\n\n{PROMPT}\n\n{content}"
+    stdout, stderr = run_model(prompt_input)
+
+    entry = (
+        f"===== BUILD ENTRY {idx}: {filename} =====\n"
+        f"Timestamp: {timestamp}\n"
+        f"Prompt SHA256: {hash_content(prompt_input)}\n"
+        f"Output SHA256: {hash_content(stdout)}\n\n"
+        f">> INPUT:
+{content}\n\n"
+        f">> OUTPUT:
+{stdout}\n"
+        f"===== END ENTRY =====\n"
+    )
+
+    with open(os.path.join(out_dir, "logs", f"log_{idx}.txt"), "w", encoding="utf-8") as f:
+        f.write(entry)
+    with open(os.path.join(out_dir, "outputs", f"output_{idx}.txt"), "w", encoding="utf-8") as f:
+        f.write(stdout)
+
+    return f"[BUILT] {filename} -> output_{idx}.txt"
+
+
+def main():
+    latest_math = get_latest_session_path("MathSessions")
+    latest_condensed = get_latest_session_path(INPUT_FOLDER)
+    if not (latest_math and latest_condensed):
+        print("[ERROR] Required session folders missing.")
+        return
+
+    with open(os.path.join(latest_math, "global_cache.txt"), "r", encoding="utf-8") as f:
+        math_data = f.read()
+
+    chunks = read_chunks_from_folder(latest_condensed)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    session_dir = os.path.join(BUILD_FOLDER, timestamp)
+    os.makedirs(os.path.join(session_dir, "logs"), exist_ok=True)
+    os.makedirs(os.path.join(session_dir, "outputs"), exist_ok=True)
+
+    args = [(i+1, chunk, math_data, session_dir) for i, chunk in enumerate(chunks)]
+    with Pool(processes=MAX_PROCESSES) as pool:
+        results = pool.map(build_component, args)
+
+    for r in results:
+        print(r)
+
+    print(f"=== BUILD SESSION COMPLETE ===\nSession folder: {session_dir}")
+
+
+if __name__ == "__main__":
+    main()
